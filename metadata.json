@@ -1,0 +1,6 @@
+{
+  "name": "TachoGuard - Čtečka a Analýza Karty Řidiče (EU 561/2006)",
+  "description": "Aplikace pro čtení čipové karty řidiče přes USB čtečku nebo soubory .DDD a vyhodnocení dodržování legislativy 561/2006 a AETR.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
