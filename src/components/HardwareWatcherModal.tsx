@@ -17,6 +17,7 @@ interface HardwareWatcherModalProps {
   isOpen: boolean;
   cardInserted: boolean;
   readerConnected: boolean;
+  bridgeConnected?: boolean;
   readerName: string;
   cardAtr: string | null;
   statusLog: Array<{ time: string; state: 'INSERTED' | 'EJECTED'; message: string }>;
@@ -32,6 +33,7 @@ export const HardwareWatcherModal: React.FC<HardwareWatcherModalProps> = ({
   isOpen,
   cardInserted,
   readerConnected,
+  bridgeConnected = false,
   readerName,
   cardAtr,
   statusLog,
@@ -148,10 +150,10 @@ export const HardwareWatcherModal: React.FC<HardwareWatcherModalProps> = ({
                 </span>
               </div>
               <div className="bg-white/90 p-2.5 rounded-xl border border-slate-200/80">
-                <span className="text-[10px] text-slate-400 uppercase font-bold block">2. Stav USB linky</span>
-                <span className={`font-bold flex items-center gap-1.5 mt-0.5 ${readerConnected ? 'text-emerald-600' : 'text-slate-500'}`}>
-                  <span className={`w-2 h-2 rounded-full ${readerConnected ? 'bg-emerald-500 animate-pulse' : 'bg-slate-300'}`} />
-                  {readerConnected ? 'Připojeno k USB' : 'Odpojeno'}
+                <span className="text-[10px] text-slate-400 uppercase font-bold block">2. Stav USB / Můstek</span>
+                <span className={`font-bold flex items-center gap-1.5 mt-0.5 ${bridgeConnected ? 'text-emerald-600' : readerConnected ? 'text-emerald-600' : 'text-slate-500'}`}>
+                  <span className={`w-2 h-2 rounded-full ${bridgeConnected || readerConnected ? 'bg-emerald-500 animate-pulse' : 'bg-slate-300'}`} />
+                  {bridgeConnected ? 'Můstek připojen 🟢' : readerConnected ? 'USB připojeno' : 'Odpojeno'}
                 </span>
               </div>
               <div className="bg-white/90 p-2.5 rounded-xl border border-slate-200/80 truncate">

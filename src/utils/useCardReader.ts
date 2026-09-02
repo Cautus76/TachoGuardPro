@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { FullTachographData, DriverCardInfo } from '../types/tachograph';
 
 export type SlotCardStatus = 'INSERTED' | 'EJECTED' | 'NO_READER';
 
@@ -7,6 +8,21 @@ export interface ConnectedDeviceInfo {
   vendorId?: number;
   productId?: number;
   isSmartCardReader: boolean;
+}
+
+// Global reference to active bridge socket if connected
+let globalBridgeSocket: WebSocket | null = null;
+let globalBridgeDataListener: ((data: Record<string, unknown>) => void) | null = null;
+
+export function getBridgeSocket(): WebSocket | null {
+  if (globalBridgeSocket && globalBridgeSocket.readyState === WebSocket.OPEN) {
+    return globalBridgeSocket;
+  }
+  return null;
+}
+
+export function setBridgeDataListener(listener: ((data: Record<string, unknown>) => void) | null) {
+  globalBridgeDataListener = listener;
 }
 
 // Simple Web Audio API sound for immediate audio feedback when card is inserted / removed
@@ -22,7 +38,6 @@ function playBeep(type: 'insert' | 'eject') {
     gain.connect(ctx.destination);
 
     if (type === 'insert') {
-      // High double ascending tone for insertion
       osc.type = 'sine';
       osc.frequency.setValueAtTime(880, ctx.currentTime);
       osc.frequency.setValueAtTime(1320, ctx.currentTime + 0.08);
@@ -31,7 +46,6 @@ function playBeep(type: 'insert' | 'eject') {
       osc.start();
       osc.stop(ctx.currentTime + 0.25);
     } else {
-      // Descending warning tone for ejection
       osc.type = 'sine';
       osc.frequency.setValueAtTime(660, ctx.currentTime);
       osc.frequency.setValueAtTime(330, ctx.currentTime + 0.08);
@@ -40,7 +54,7 @@ function playBeep(type: 'insert' | 'eject') {
       osc.start();
       osc.stop(ctx.currentTime + 0.25);
     }
-  } catch (e) {
+  } catch {
     // Audio policy may prevent sound before first interaction
   }
 }
@@ -48,6 +62,7 @@ function playBeep(type: 'insert' | 'eject') {
 export function useCardReaderStatus(hasLoadedData: boolean) {
   const [readerConnected, setReaderConnected] = useState<boolean>(true);
   const [readerName, setReaderName] = useState<string>('Alcor Link AK9563 (EMV Smartcard Reader)');
+  const [bridgeConnected, setBridgeConnected] = useState<boolean>(false);
   
   // Card insertion state - defaults to false (empty slot / ejected)
   const [cardInserted, setCardInsertedState] = useState<boolean>(() => {
@@ -176,6 +191,76 @@ export function useCardReaderStatus(hasLoadedData: boolean) {
     return false;
   }, [updateCardInserted]);
 
+  // Connect to local WebSocket bridge on port 9563
+  useEffect(() => {
+    let ws: WebSocket | null = null;
+    let reconnectTimeout: ReturnType<typeof setTimeout>;
+    let isSubscribed = true;
+
+    const connectBridge = () => {
+      if (!isSubscribed) return;
+      try {
+        ws = new WebSocket('ws://127.0.0.1:9563');
+
+        ws.onopen = () => {
+          if (!isSubscribed) return;
+          console.log('🔌 Připojeno k PC/SC můstku čtečky na 127.0.0.1:9563');
+          setBridgeConnected(true);
+          globalBridgeSocket = ws;
+        };
+
+        ws.onmessage = (event) => {
+          if (!isSubscribed) return;
+          try {
+            const data = JSON.parse(event.data);
+            if (globalBridgeDataListener) {
+              globalBridgeDataListener(data);
+            }
+
+            if (data.type === 'CARD_STATUS' || data.status) {
+              const statusStr = data.status || '';
+              if (statusStr === 'INSERTED') {
+                updateCardInserted(true, 'macOS Čtečka AK9563', data.atr);
+              } else if (statusStr === 'EJECTED' || statusStr === 'NO_READER') {
+                updateCardInserted(false, 'macOS Čtečka AK9563');
+              }
+            }
+          } catch {
+            // non-json message
+          }
+        };
+
+        ws.onclose = () => {
+          if (!isSubscribed) return;
+          setBridgeConnected(false);
+          globalBridgeSocket = null;
+          reconnectTimeout = setTimeout(connectBridge, 2000);
+        };
+
+        ws.onerror = () => {
+          if (!isSubscribed) return;
+          setBridgeConnected(false);
+          globalBridgeSocket = null;
+        };
+      } catch {
+        if (isSubscribed) {
+          reconnectTimeout = setTimeout(connectBridge, 2000);
+        }
+      }
+    };
+
+    connectBridge();
+
+    return () => {
+      isSubscribed = false;
+      clearTimeout(reconnectTimeout);
+      if (ws) {
+        ws.close();
+      }
+      globalBridgeSocket = null;
+    };
+  }, [updateCardInserted]);
+
   // Continuous background monitoring loop inside the application (every 800ms)
   useEffect(() => {
     checkHardware();
@@ -253,6 +338,7 @@ export function useCardReaderStatus(hasLoadedData: boolean) {
     readerConnected,
     setReaderConnected,
     readerName,
+    bridgeConnected,
     cardInserted,
     setCardInserted: updateCardInserted,
     ejectCard,

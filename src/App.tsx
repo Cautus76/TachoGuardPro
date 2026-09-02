@@ -44,6 +44,7 @@ export default function App() {
   const {
     readerConnected,
     readerName,
+    bridgeConnected,
     cardInserted,
     cardAtr,
     statusLog,
@@ -384,6 +385,7 @@ export default function App() {
         isOpen={isWatcherModalOpen}
         cardInserted={cardInserted}
         readerConnected={readerConnected}
+        bridgeConnected={bridgeConnected}
         readerName={readerName}
         cardAtr={cardAtr}
         statusLog={statusLog}

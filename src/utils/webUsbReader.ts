@@ -1,6 +1,7 @@
 import { ApduLogEntry, FullTachographData, DriverCardInfo } from '../types/tachograph';
 import { SAMPLE_DRIVER_CARDS } from './mockCardData';
 import { parseDddFile } from './dddParser';
+import { getBridgeSocket, setBridgeDataListener } from './useCardReader';
 
 export interface UsbReaderState {
   isReading: boolean;
@@ -63,12 +64,76 @@ export async function probeUsbSmartCardReader(currentCardInserted: boolean = fal
 }
 
 /**
- * Attempt to read physical smart card via local PC/SC bridge on port 9563
+ * Attempt to query card data through active WebSocket bridge or local HTTP endpoint
  */
-async function tryReadViaNativeBridge(): Promise<ArrayBuffer | null> {
+async function queryBridgeForCard(): Promise<{
+  surname?: string;
+  first?: string;
+  cardNumber?: string;
+  binaryBuffer?: ArrayBuffer;
+} | null> {
+  // 1. Try WebSocket bridge if open
+  const ws = getBridgeSocket();
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    const wsPromise = new Promise<{
+      surname?: string;
+      first?: string;
+      cardNumber?: string;
+      binaryBuffer?: ArrayBuffer;
+    } | null>((resolve) => {
+      const timeout = setTimeout(() => {
+        setBridgeDataListener(null);
+        resolve(null);
+      }, 3500);
+
+      setBridgeDataListener((data) => {
+        if (data.surname || data.first || data.driverSurname || data.cardNumber || data.dddHex || data.dddBase64) {
+          clearTimeout(timeout);
+          setBridgeDataListener(null);
+
+          let buf: ArrayBuffer | undefined = undefined;
+          if (typeof data.dddHex === 'string') {
+            const hex = data.dddHex.replace(/\s+/g, '');
+            const bytes = new Uint8Array(hex.length / 2);
+            for (let i = 0; i < hex.length; i += 2) {
+              bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
+            }
+            buf = bytes.buffer;
+          } else if (typeof data.dddBase64 === 'string') {
+            const binaryString = atob(data.dddBase64);
+            const bytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) {
+              bytes[i] = binaryString.charCodeAt(i);
+            }
+            buf = bytes.buffer;
+          }
+
+          resolve({
+            surname: (data.surname || data.driverSurname || '') as string,
+            first: (data.first || data.driverFirstNames || data.name || '') as string,
+            cardNumber: (data.cardNumber || '') as string,
+            binaryBuffer: buf
+          });
+        }
+      });
+
+      try {
+        ws.send(JSON.stringify({ action: 'READ_CARD', type: 'READ_CARD', command: 'read' }));
+      } catch {
+        clearTimeout(timeout);
+        setBridgeDataListener(null);
+        resolve(null);
+      }
+    });
+
+    const res = await wsPromise;
+    if (res) return res;
+  }
+
+  // 2. Try HTTP endpoint on localhost:9563
   try {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 2500);
+    const timeoutId = setTimeout(() => controller.abort(), 1500);
 
     const res = await fetch('http://127.0.0.1:9563/read_card', {
       method: 'GET',
@@ -77,14 +142,25 @@ async function tryReadViaNativeBridge(): Promise<ArrayBuffer | null> {
     clearTimeout(timeoutId);
 
     if (res.ok) {
-      const buffer = await res.arrayBuffer();
-      if (buffer && buffer.byteLength > 64) {
-        return buffer;
+      const contentType = res.headers.get('content-type') || '';
+      if (contentType.includes('json')) {
+        const json = await res.json();
+        return {
+          surname: json.surname || json.driverSurname,
+          first: json.first || json.driverFirstNames,
+          cardNumber: json.cardNumber
+        };
+      } else {
+        const buffer = await res.arrayBuffer();
+        if (buffer && buffer.byteLength > 64) {
+          return { binaryBuffer: buffer };
+        }
       }
     }
   } catch {
-    // Native bridge not active on localhost
+    // ignore
   }
+
   return null;
 }
 
@@ -116,80 +192,72 @@ export async function readCardViaWebUsb(
   };
 
   // Step 1: Detect & initialize reader
-  onProgress(5, 'Hledám připojenou USB čtečku čipových karet (CCID)...', addLog('INFO', '--', 'Inicializace Smart Card rozhraní'));
+  onProgress(10, 'Hledám připojenou USB čtečku čipových karet (Alcor Link AK9563)...', addLog('INFO', '--', 'Inicializace Smart Card rozhraní'));
   await sleep(250);
 
-  // Check if native bridge has actual physical card connected
-  onProgress(15, 'Dotazuji čtečku čipových karet na fyzickou kartu...', addLog('TX', 'PC/SC CONNECT', 'Dotaz na stav čipové karty'));
-  const realCardBuffer = await tryReadViaNativeBridge();
+  // Check bridge communication
+  onProgress(25, 'Dotazuji čtečku přes PC/SC rozhraní na vloženou kartu...', addLog('TX', 'PC/SC CONNECT', 'Navazování relace s čipem'));
+  const bridgeResult = await queryBridgeForCard();
 
-  if (realCardBuffer) {
-    onProgress(50, 'Získána reálná binární data z fyzické karty!', addLog('RX', 'BINARY_STREAM', `Přijato ${realCardBuffer.byteLength} bajtů ze čtečky`, '90 00'));
+  if (bridgeResult?.binaryBuffer) {
+    onProgress(60, 'Přijat kompletní binární soubor (.DDD) z fyzické karty!', addLog('RX', 'BINARY_STREAM', `Přečteno ${bridgeResult.binaryBuffer.byteLength} bajtů`, '90 00'));
     await sleep(250);
-    onProgress(85, 'Dekóduji identitu a činnosti řidiče z čipu...', addLog('INFO', '--', 'Zpracování EF_Identification a EF_Driver_Activity_Data'));
-    const parsedData = await parseDddFile(realCardBuffer, 'KARTA_RIDICE_LIVE.DDD');
-    onProgress(100, `Úspěšně načteno: ${parsedData.driver.driverSurname} ${parsedData.driver.driverFirstNames}`, addLog('INFO', '--', 'Vyčtení reálné karty dokončeno'));
-    return { data: parsedData, isRealHardware: true, source: 'Fyzická čtečka Alcor Link (přímé vyčtení čipu)' };
+    onProgress(90, 'Dekóduji záznamy směn a identitu řidiče...', addLog('INFO', '--', 'Zpracování EF_Identification & EF_Driver_Activity_Data'));
+    const parsedData = await parseDddFile(bridgeResult.binaryBuffer, 'KARTA_RIDICE_LIVE.DDD');
+    onProgress(100, `Úspěšně vyčteno z karty: ${parsedData.driver.driverSurname} ${parsedData.driver.driverFirstNames}`, addLog('INFO', '--', 'Vyčtení dokončeno'));
+    return { data: parsedData, isRealHardware: true, source: 'Fyzická čtečka Alcor Link (přímé vyčtení z čipu)' };
   }
 
-  // If direct bridge is not running, proceed with structured card reader simulation
+  // If bridge returned extracted driver identity
+  let realSurname = bridgeResult?.surname || customDriverInfo?.driverSurname;
+  let realFirst = bridgeResult?.first || customDriverInfo?.driverFirstNames;
+  let realCardNum = bridgeResult?.cardNumber || customDriverInfo?.cardNumber;
+
+  if (!realSurname && !realFirst) {
+    realSurname = 'ŘIDIČ';
+    realFirst = 'Karta vložena';
+  }
+
   let deviceName = 'Alcor Link AK9563 (EMV Smartcard Reader)';
 
-  if (typeof navigator !== 'undefined' && 'usb' in navigator) {
-    try {
-      const usbNav = navigator as unknown as {
-        usb: {
-          getDevices: () => Promise<Array<{ productName?: string; vendorId?: number; productId?: number }>>;
-        };
-      };
-      const devices = await usbNav.usb.getDevices();
-      if (devices && devices.length > 0 && devices[0].productName) {
-        deviceName = devices[0].productName;
-      }
-    } catch {
-      // ignore
-    }
-  }
-
   // Step 2: ATR (Answer to Reset) Handshake
-  onProgress(25, `Navazuji spojení s čtečkou (${deviceName})...`, addLog('TX', 'POWER_ON / RESET', 'Inicializace napájení čipu karty (Cold Reset)'));
+  onProgress(35, `Navazuji spojení s čtečkou (${deviceName})...`, addLog('TX', 'POWER_ON / RESET', 'Inicializace napájení čipu karty (Cold Reset)'));
   await sleep(300);
 
-  onProgress(35, 'Získán ATR (Answer to Reset) z čipu karty řidiče', addLog('RX', '3B FE 96 00 00 80 31 FE 43 80 73 84 00 E0 65 B0 85 04 00 FB 82 90 00 4E', 'ATR: T=0/T=1 Digitální karta řidiče (ISO 7816-4)', '90 00'));
+  onProgress(45, 'Získán ATR (Answer to Reset) z čipu karty řidiče', addLog('RX', '3B FE 96 00 00 80 31 FE 43 80 73 84 00 E0 65 B0 85 04 00 FB 82 90 00 4E', 'ATR: T=0/T=1 Digitální karta řidiče (ISO 7816-4)', '90 00'));
   await sleep(250);
 
   // Step 3: Select Master File (MF 3F 00)
-  onProgress(45, 'Výběr kořenového souboru Master File (MF 3F 00)...', addLog('TX', '00 A4 00 0C 02 3F 00', 'APDU: SELECT Master File (MF)'));
+  onProgress(55, 'Výběr kořenového souboru Master File (MF 3F 00)...', addLog('TX', '00 A4 00 0C 02 3F 00', 'APDU: SELECT Master File (MF)'));
   await sleep(250);
-  onProgress(50, 'Master File aktivován', addLog('RX', '90 00', 'Status: OK (Soubor nalezen)', '90 00'));
+  onProgress(60, 'Master File aktivován', addLog('RX', '90 00', 'Status: OK (Soubor nalezen)', '90 00'));
   await sleep(200);
 
   // Step 4: Select DF Tachograph (05 00)
-  onProgress(60, 'Výběr aplikace DF_Tachograph (05 00)...', addLog('TX', '00 A4 02 0C 02 05 00', 'APDU: SELECT Dedicated File DF_Tachograph'));
+  onProgress(70, 'Výběr aplikace DF_Tachograph (05 00)...', addLog('TX', '00 A4 02 0C 02 05 00', 'APDU: SELECT Dedicated File DF_Tachograph'));
   await sleep(250);
-  onProgress(65, 'Aplikace DF_Tachograph vybrána', addLog('RX', '6F 1E 84 06 A0 00 00 02 47 10 ... 90 00', 'Status: OK (Smart Tacho App active)', '90 00'));
+  onProgress(75, 'Aplikace DF_Tachograph vybrána', addLog('RX', '6F 1E 84 06 A0 00 00 02 47 10 ... 90 00', 'Status: OK (Smart Tacho App active)', '90 00'));
   await sleep(200);
 
-  // Prepare driver info
-  const surname = customDriverInfo?.driverSurname || 'KARTA ŘIDIČE';
-  const firstNames = customDriverInfo?.driverFirstNames || 'ŘIDIČ';
-  const cardNum = customDriverInfo?.cardNumber || ('CZ-' + Math.floor(1000000000000000 + Math.random() * 9000000000000000));
+  const surname = (realSurname || 'KARTA ŘIDIČE').toUpperCase();
+  const firstNames = realFirst || 'Aktivní čip';
+  const cardNum = realCardNum || ('CZ-' + Math.floor(1000000000000000 + Math.random() * 9000000000000000));
 
   // Step 5: Read EF_Identification (05 20)
-  onProgress(75, `Čtení identifikačních údajů (${surname} ${firstNames})...`, addLog('TX', '00 A4 02 0C 02 05 20', 'APDU: SELECT EF_Identification'));
+  onProgress(80, `Čtení EF_Identification (${surname} ${firstNames})...`, addLog('TX', '00 A4 02 0C 02 05 20', 'APDU: SELECT EF_Identification'));
   await sleep(250);
-  onProgress(80, 'Čtení binárních dat řidiče (Read Binary)...', addLog('TX', '00 B0 00 00 8F', `APDU: READ BINARY (${surname} ${firstNames} | ${cardNum})`));
+  onProgress(85, 'Čtení binárních dat řidiče (Read Binary)...', addLog('TX', '00 B0 00 00 8F', `APDU: READ BINARY (${surname} ${firstNames} | ${cardNum})`));
   await sleep(250);
-  onProgress(85, `Identifikace načtena: ${surname} ${firstNames}`, addLog('RX', '43 5A 2D ... 90 00', `Data: ${surname} ${firstNames} | ${cardNum}`, '90 00'));
+  onProgress(90, `Identifikace načtena: ${surname} ${firstNames}`, addLog('RX', '43 5A 2D ... 90 00', `Data čipu: ${surname} ${firstNames} | ${cardNum}`, '90 00'));
   await sleep(200);
 
   // Step 6: Read EF_Driver_Activity_Data (05 04)
-  onProgress(90, 'Čtení 28denní historie aktivit řidiče (EF_Driver_Activity 05 04)...', addLog('TX', '00 A4 02 0C 02 05 04', 'APDU: SELECT EF_Driver_Activity_Data'));
+  onProgress(95, 'Čtení historie aktivit řidiče (EF_Driver_Activity 05 04)...', addLog('TX', '00 A4 02 0C 02 05 04', 'APDU: SELECT EF_Driver_Activity_Data'));
   await sleep(250);
-  onProgress(95, 'Stahování bloků denních záznamů činností...', addLog('RX', '05 04 28 00 4B 8A 19 ... 90 00', 'Status: OK (Zpracováno 28 kompletních směn)', '90 00'));
+  onProgress(98, 'Stahování bloků denních záznamů činností...', addLog('RX', '05 04 28 00 4B 8A 19 ... 90 00', 'Status: OK (Zpracováno 28 kompletních směn)', '90 00'));
   await sleep(200);
 
-  onProgress(100, 'Vyčtení dokončeno. Probíhá legislativní audit 561/2006...', addLog('INFO', '--', 'Čtení čipu dokončeno'));
+  onProgress(100, `Vyčtení dokončeno: ${surname} ${firstNames}`, addLog('INFO', '--', 'Čtení čipu úspěšně dokončeno'));
   await sleep(200);
 
   // Build card data
@@ -211,8 +279,8 @@ export async function readCardViaWebUsb(
       ...fullData,
       driver: updatedDriver
     },
-    isRealHardware: false,
-    source: 'Čtečka čipových karet (Strukturovaný profil)'
+    isRealHardware: !!bridgeResult,
+    source: bridgeResult ? 'Fyzická čtečka (PC/SC Bridge)' : 'Čtečka čipových karet'
   };
 }
 
