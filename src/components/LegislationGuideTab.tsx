@@ -284,6 +284,68 @@ export const LegislationGuideTab: React.FC = () => {
           )}
         </div>
 
+        {/* SECTION 6: Country Symbols, Border Crossings & Shift Continuity */}
+        <div className="bg-white border border-slate-200 rounded-xl overflow-hidden shadow-sm">
+          <button
+            onClick={() => toggle('countries')}
+            className="w-full p-6 text-left flex items-center justify-between hover:bg-slate-50 transition-colors cursor-pointer"
+          >
+            <div className="flex items-center gap-3">
+              <div className="w-8 h-8 rounded-lg bg-emerald-50 text-emerald-600 flex items-center justify-center font-bold text-sm">
+                6
+              </div>
+              <div>
+                <h4 className="font-bold text-base text-slate-800">
+                  Symboly zemí, přejezdy hranic & návaznost směn (Čl. 34 Nařízení 165/2014)
+                </h4>
+                <p className="text-xs text-slate-500">Výchozí země, cílová země, hraniční přechody a kontinuita států</p>
+              </div>
+            </div>
+            {expandedSection === 'countries' ? <ChevronUp className="w-5 h-5 text-slate-400" /> : <ChevronDown className="w-5 h-5 text-slate-400" />}
+          </button>
+
+          {expandedSection === 'countries' && (
+            <div className="p-6 pt-0 border-t border-slate-100 space-y-4 text-xs text-slate-600">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-4">
+                <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+                  <span className="font-bold text-emerald-700 text-sm block">1. Výchozí země (Začátek směny)</span>
+                  <p className="leading-relaxed">
+                    Při zahájení denní pracovní doby / vložení karty je řidič <strong>povinen zadat symbol státu</strong> (např. CZ, D, PL), ve kterém začíná pracovat.
+                  </p>
+                  <p className="text-emerald-800 bg-emerald-50 p-2 rounded border border-emerald-200 text-[11px] font-semibold">
+                    Čl. 34 odst. 7: Začátek směny bez zadání výchozí země je závažný přestupek.
+                  </p>
+                </div>
+
+                <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+                  <span className="font-bold text-blue-700 text-sm block">2. Přejezd hranic (Balíček mobility)</span>
+                  <p className="leading-relaxed">
+                    Od 2. února 2022 musí řidič po přejetí státní hranice zastavit na <strong>nejbližším vhodném místě na hranici nebo za ní</strong> a zadat do tachografu symbol země, do které vstoupil (u Smart Tacho Gen 2 se zapisuje automaticky přes GNSS).
+                  </p>
+                </div>
+
+                <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+                  <span className="font-bold text-indigo-700 text-sm block">3. Návaznost zemí po odpočinku</span>
+                  <p className="leading-relaxed">
+                    Pokud ukončíte směnu v Německu (<strong>Cílová země: D</strong>) a strávíte tam denní odpočinek, musíte následující den zahájit směnu v téže zemi (<strong>Výchozí země: D</strong>).
+                  </p>
+                  <p className="text-amber-800 bg-amber-50 p-2 rounded border border-amber-200 text-[11px]">
+                    Pokud druhý den zapomenete zadat výchozí zemi D nebo zadáte CZ, vzniká rozpor a přestupek neoprávněného zadání či absence výchozí země!
+                  </p>
+                </div>
+              </div>
+
+              <div className="p-3.5 bg-slate-100 border border-slate-300 rounded-xl text-slate-800 space-y-1">
+                <strong>Praktický příklad pro kontrolu:</strong>
+                <p className="text-[11px] text-slate-600">
+                  Den 1: Výjezd z ČR do Německa ➔ Start: <code>CZ</code> ➔ Přejezd hranice: <code>D</code> ➔ Konec směny / Odpočinek v DE: <code>D</code>.<br />
+                  Den 2: Probuzení v Německu a zahájení další směny ➔ <strong>Výchozí země MUSÍ být <code>D</code>!</strong> Teprve po návratu do ČR zadáte přejezd hranice a cíl <code>CZ</code>.
+                </p>
+              </div>
+            </div>
+          )}
+        </div>
+
       </div>
 
     </div>

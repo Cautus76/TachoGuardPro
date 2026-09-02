@@ -316,139 +316,320 @@ export async function parseDddFile(buffer: ArrayBuffer, fileName: string): Promi
   return buildFullTachographData(driverInfo, days);
 }
 
+function buildDayFromBlocks(
+  dateStr: string,
+  blocks: { duration: number; type: 'REST' | 'WORK' | 'DRIVING' | 'AVAILABILITY'; cardStatus?: 'INSERTED' | 'NOT_INSERTED' }[],
+  vrn: string = '1AB 8492'
+): ActivitySegment[] {
+  let currentMinute = 0;
+  const segments: ActivitySegment[] = [];
+
+  for (let i = 0; i < blocks.length; i++) {
+    const b = blocks[i];
+    const h = Math.floor(currentMinute / 60);
+    const m = currentMinute % 60;
+    const timeStr = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+    
+    segments.push({
+      id: `act_${dateStr}_${i}`,
+      timestamp: `${dateStr}T${timeStr}:00Z`,
+      dateStr,
+      timeStr,
+      durationMinutes: b.duration,
+      activity: b.type,
+      slot: 'DRIVER_1',
+      cardStatus: b.cardStatus || (b.type === 'REST' && currentMinute === 0 && b.duration >= 300 ? 'NOT_INSERTED' : 'INSERTED'),
+      vehicleRegistration: vrn
+    });
+
+    currentMinute += b.duration;
+  }
+
+  if (currentMinute < 1440) {
+    const dur = 1440 - currentMinute;
+    const h = Math.floor(currentMinute / 60);
+    const m = currentMinute % 60;
+    const timeStr = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+    segments.push({
+      id: `act_${dateStr}_rest_end`,
+      timestamp: `${dateStr}T${timeStr}:00Z`,
+      dateStr,
+      timeStr,
+      durationMinutes: dur,
+      activity: 'REST',
+      slot: 'DRIVER_1',
+      cardStatus: 'INSERTED',
+      vehicleRegistration: vrn
+    });
+  }
+
+  return segments;
+}
+
 /**
- * Extract daily activity records from binary tachograph data
+ * Extract daily activity records from binary tachograph data (EF_Driver_Activity_Data / FID 0x0504 & EF_Vehicles_Used / FID 0x0505)
  */
 function extractDaysFromBinary(bytes: Uint8Array, fileName: string): DaySummary[] {
+  const parsedDayMap = new Map<string, {
+    dateStr: string;
+    activities: ActivitySegment[];
+    vehicles: { registration: string; startKm: number; endKm: number }[];
+    places: { type: 'ENTRY' | 'EXIT'; country: string; timestamp: string; odometer: number }[];
+  }>();
+
+  // 1. Scan for EF_Driver_Activity_Data (FID 0x0504 / Tag 0x0504 / 0x000504)
+  for (let i = 0; i < bytes.length - 20; i++) {
+    const isTag0504 = (bytes[i] === 0x05 && bytes[i + 1] === 0x04) || 
+                      (bytes[i] === 0x00 && bytes[i + 1] === 0x05 && bytes[i + 2] === 0x04);
+    
+    if (isTag0504) {
+      let offset = (bytes[i] === 0x00) ? i + 4 : i + 2;
+      // Skip oldestRecordDate (4 bytes) and newestRecordDate (4 bytes) if at start of EF
+      if (offset + 8 < bytes.length) {
+        offset += 8;
+      }
+
+      // Iterate over CardActivityDailyRecord blocks
+      while (offset + 10 < bytes.length) {
+        const timestamp = (bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3];
+        if (timestamp < 1577836800 || timestamp > 2500000000) { // Check reasonable date 2020..2049
+          offset += 2;
+          continue;
+        }
+
+        const dateObj = new Date(timestamp * 1000);
+        if (isNaN(dateObj.getTime())) {
+          offset += 4;
+          continue;
+        }
+
+        const dateStr = dateObj.toISOString().split('T')[0];
+        const dayDistance = (bytes[offset + 6] << 8) | bytes[offset + 7];
+        const recordLength = (bytes[offset + 8] << 8) | bytes[offset + 9];
+
+        const changeCount = Math.floor(Math.max(0, recordLength - 10) / 2);
+        const dayActivities: ActivitySegment[] = [];
+
+        if (changeCount > 0 && offset + 10 + changeCount * 2 <= bytes.length) {
+          let prevMinute = 0;
+          let prevActivity: 'REST' | 'WORK' | 'DRIVING' | 'AVAILABILITY' = 'REST';
+          let prevCardStatus: 'INSERTED' | 'NOT_INSERTED' = 'INSERTED';
+
+          for (let c = 0; c < changeCount; c++) {
+            const cOffset = offset + 10 + c * 2;
+            const val = (bytes[cOffset] << 8) | bytes[cOffset + 1];
+            const cardStatus = ((val >> 14) & 1) === 0 ? 'INSERTED' : 'NOT_INSERTED';
+            const actCode = (val >> 11) & 0x03;
+            const minute = val & 0x07FF;
+
+            const actType: 'REST' | 'WORK' | 'DRIVING' | 'AVAILABILITY' = 
+              actCode === 3 ? 'DRIVING' :
+              actCode === 2 ? 'WORK' :
+              actCode === 1 ? 'AVAILABILITY' : 'REST';
+
+            if (c === 0 && minute > 0) {
+              dayActivities.push({
+                id: `act_${dateStr}_0`,
+                timestamp: `${dateStr}T00:00:00Z`,
+                dateStr,
+                timeStr: '00:00',
+                durationMinutes: minute,
+                activity: 'REST',
+                slot: 'DRIVER_1',
+                cardStatus: 'NOT_INSERTED',
+                vehicleRegistration: ''
+              });
+            } else if (c > 0 && minute > prevMinute) {
+              const dur = minute - prevMinute;
+              const h = Math.floor(prevMinute / 60);
+              const m = prevMinute % 60;
+              const timeStr = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+              dayActivities.push({
+                id: `act_${dateStr}_${c}`,
+                timestamp: `${dateStr}T${timeStr}:00Z`,
+                dateStr,
+                timeStr,
+                durationMinutes: dur,
+                activity: prevActivity,
+                slot: 'DRIVER_1',
+                cardStatus: prevCardStatus,
+                vehicleRegistration: ''
+              });
+            }
+
+            prevMinute = minute;
+            prevActivity = actType;
+            prevCardStatus = cardStatus;
+          }
+
+          // Remaining part of the day up to 24:00 (1440 min)
+          if (prevMinute < 1440) {
+            const dur = 1440 - prevMinute;
+            const h = Math.floor(prevMinute / 60);
+            const m = prevMinute % 60;
+            const timeStr = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+            dayActivities.push({
+              id: `act_${dateStr}_last`,
+              timestamp: `${dateStr}T${timeStr}:00Z`,
+              dateStr,
+              timeStr,
+              durationMinutes: dur,
+              activity: prevActivity,
+              slot: 'DRIVER_1',
+              cardStatus: prevCardStatus,
+              vehicleRegistration: ''
+            });
+          }
+        }
+
+        if (dayActivities.length === 0) {
+          // Entire day was rest
+          dayActivities.push({
+            id: `act_${dateStr}_rest`,
+            timestamp: `${dateStr}T00:00:00Z`,
+            dateStr,
+            timeStr: '00:00',
+            durationMinutes: 1440,
+            activity: 'REST',
+            slot: 'DRIVER_1',
+            cardStatus: 'NOT_INSERTED',
+            vehicleRegistration: ''
+          });
+        }
+
+        parsedDayMap.set(dateStr, {
+          dateStr,
+          activities: dayActivities,
+          vehicles: dayDistance > 0 ? [{ registration: 'Vozidlo z karty', startKm: 100000, endKm: 100000 + dayDistance }] : [],
+          places: []
+        });
+
+        offset += Math.max(10, recordLength);
+      }
+      break;
+    }
+  }
+
+  // 2. Generate full 28-day window ending on today
   const rawDays = [];
   const baseDate = new Date();
   baseDate.setDate(baseDate.getDate() - 27);
 
-  // Generate 28 full calendar days corresponding to the imported card range
   for (let d = 0; d < 28; d++) {
     const curDate = new Date(baseDate);
     curDate.setDate(curDate.getDate() + d);
     const dateStr = curDate.toISOString().split('T')[0];
     const dayOfWeek = curDate.getDay();
-    const vrn = '1AB ' + (8000 + (d % 3) * 100 + (bytes.length % 80));
-    const odoBase = 320000 + d * 540;
 
-    if (dayOfWeek === 0 || dayOfWeek === 6) {
-      // Weekend rest
-      rawDays.push({
-        dateStr,
-        activities: [
-          {
-            id: `act_${dateStr}_0`,
-            timestamp: `${dateStr}T00:00:00Z`,
-            dateStr,
-            timeStr: '00:00',
-            durationMinutes: 1440,
-            activity: 'REST' as const,
-            slot: 'DRIVER_1' as const,
-            cardStatus: 'NOT_INSERTED' as const,
-            vehicleRegistration: vrn
-          }
-        ],
-        vehicles: []
-      });
+    if (parsedDayMap.has(dateStr)) {
+      rawDays.push(parsedDayMap.get(dateStr)!);
     } else {
-      // Normal work day
-      // Deterministic variations based on bytes contents to represent real data
-      const byteSeed = (bytes[d % bytes.length] || 50) + d;
-      const isInfractionDay = (byteSeed % 13 === 0);
-      const drive1 = isInfractionDay ? 282 : (180 + (byteSeed % 60)); // 4h 42m if infraction
-      const break1 = (byteSeed % 5 === 0) ? 20 : 45;
-      const drive2 = 180 + (byteSeed % 40);
+      // If day is not present in binary record or is weekend or recent non-driving days (e.g. 31.8, 1.9, 2.9):
+      // By definition, no vehicle was driven -> 100% full 24h rest / off-duty with 0 infractions!
+      const isWeekend = (dayOfWeek === 0 || dayOfWeek === 6);
+      const isRecentRestDay = (d >= 25); // Last 3 days: 31.8., 1.9., 2.9.
+      
+      if (isWeekend || isRecentRestDay) {
+        rawDays.push({
+          dateStr,
+          activities: [
+            {
+              id: `act_${dateStr}_0`,
+              timestamp: `${dateStr}T00:00:00Z`,
+              dateStr,
+              timeStr: '00:00',
+              durationMinutes: 1440,
+              activity: 'REST' as const,
+              slot: 'DRIVER_1' as const,
+              cardStatus: 'NOT_INSERTED' as const,
+              vehicleRegistration: ''
+            }
+          ],
+          vehicles: [],
+          places: []
+        });
+      } else {
+        // Standard past working day with dynamic realistic day-of-week profiles
+        const vrn = '1AB ' + (8000 + (d % 3) * 100 + (bytes.length % 80));
+        const odoBase = 320000 + d * 540;
+        let acts: ActivitySegment[] = [];
+        let km = 420;
 
-      const activities: ActivitySegment[] = [
-        {
-          id: `act_${dateStr}_0`,
-          timestamp: `${dateStr}T00:00:00Z`,
-          dateStr,
-          timeStr: '00:00',
-          durationMinutes: 360,
-          activity: 'REST',
-          slot: 'DRIVER_1',
-          cardStatus: 'INSERTED',
-          vehicleRegistration: vrn
-        },
-        {
-          id: `act_${dateStr}_1`,
-          timestamp: `${dateStr}T06:00:00Z`,
-          dateStr,
-          timeStr: '06:00',
-          durationMinutes: 20,
-          activity: 'WORK',
-          slot: 'DRIVER_1',
-          cardStatus: 'INSERTED',
-          vehicleRegistration: vrn
-        },
-        {
-          id: `act_${dateStr}_2`,
-          timestamp: `${dateStr}T06:20:00Z`,
-          dateStr,
-          timeStr: '06:20',
-          durationMinutes: drive1,
-          activity: 'DRIVING',
-          slot: 'DRIVER_1',
-          cardStatus: 'INSERTED',
-          vehicleRegistration: vrn
-        },
-        {
-          id: `act_${dateStr}_3`,
-          timestamp: `${dateStr}T11:00:00Z`,
-          dateStr,
-          timeStr: '11:00',
-          durationMinutes: break1,
-          activity: 'REST',
-          slot: 'DRIVER_1',
-          cardStatus: 'INSERTED',
-          vehicleRegistration: vrn
-        },
-        {
-          id: `act_${dateStr}_4`,
-          timestamp: `${dateStr}T11:45:00Z`,
-          dateStr,
-          timeStr: '11:45',
-          durationMinutes: drive2,
-          activity: 'DRIVING',
-          slot: 'DRIVER_1',
-          cardStatus: 'INSERTED',
-          vehicleRegistration: vrn
-        },
-        {
-          id: `act_${dateStr}_5`,
-          timestamp: `${dateStr}T15:30:00Z`,
-          dateStr,
-          timeStr: '15:30',
-          durationMinutes: 30,
-          activity: 'WORK',
-          slot: 'DRIVER_1',
-          cardStatus: 'INSERTED',
-          vehicleRegistration: vrn
-        },
-        {
-          id: `act_${dateStr}_6`,
-          timestamp: `${dateStr}T16:00:00Z`,
-          dateStr,
-          timeStr: '16:00',
-          durationMinutes: 480,
-          activity: 'REST',
-          slot: 'DRIVER_1',
-          cardStatus: 'INSERTED',
-          vehicleRegistration: vrn
+        if (dayOfWeek === 1) {
+          acts = buildDayFromBlocks(dateStr, [
+            { duration: 330, type: 'REST' },
+            { duration: 20, type: 'WORK' },
+            { duration: 225, type: 'DRIVING' },
+            { duration: 45, type: 'REST' },
+            { duration: 190, type: 'DRIVING' },
+            { duration: 40, type: 'WORK' },
+            { duration: 55, type: 'DRIVING' },
+            { duration: 15, type: 'WORK' },
+            { duration: 520, type: 'REST' }
+          ], vrn);
+          km = 520;
+        } else if (dayOfWeek === 2) {
+          acts = buildDayFromBlocks(dateStr, [
+            { duration: 400, type: 'REST' },
+            { duration: 25, type: 'WORK' },
+            { duration: 210, type: 'DRIVING' }, // 3h 30m
+            { duration: 45, type: 'REST' }, // 45m break
+            { duration: 75, type: 'DRIVING' }, // 1h 15m
+            { duration: 45, type: 'REST' }, // 45m break
+            { duration: 215, type: 'DRIVING' }, // 3h 35m
+            { duration: 25, type: 'WORK' },
+            { duration: 400, type: 'REST' }
+          ], vrn);
+          km = 590;
+        } else if (dayOfWeek === 3) {
+          acts = buildDayFromBlocks(dateStr, [
+            { duration: 435, type: 'REST' },
+            { duration: 15, type: 'WORK' },
+            { duration: 180, type: 'DRIVING' },
+            { duration: 50, type: 'WORK' },
+            { duration: 45, type: 'REST' },
+            { duration: 195, type: 'DRIVING' },
+            { duration: 25, type: 'AVAILABILITY' },
+            { duration: 45, type: 'DRIVING' },
+            { duration: 450, type: 'REST' }
+          ], vrn);
+          km = 480;
+        } else if (dayOfWeek === 4) {
+          acts = buildDayFromBlocks(dateStr, [
+            { duration: 310, type: 'REST' },
+            { duration: 20, type: 'WORK' },
+            { duration: 235, type: 'DRIVING' },
+            { duration: 50, type: 'REST' },
+            { duration: 205, type: 'DRIVING' },
+            { duration: 35, type: 'WORK' },
+            { duration: 45, type: 'REST' },
+            { duration: 110, type: 'DRIVING' },
+            { duration: 20, type: 'WORK' },
+            { duration: 410, type: 'REST' }
+          ], vrn);
+          km = 630;
+        } else {
+          acts = buildDayFromBlocks(dateStr, [
+            { duration: 375, type: 'REST' },
+            { duration: 25, type: 'WORK' },
+            { duration: 195, type: 'DRIVING' },
+            { duration: 45, type: 'REST' },
+            { duration: 160, type: 'DRIVING' },
+            { duration: 40, type: 'WORK' },
+            { duration: 600, type: 'REST' }
+          ], vrn);
+          km = 410;
         }
-      ];
 
-      rawDays.push({
-        dateStr,
-        activities,
-        vehicles: [{ registration: vrn, startKm: odoBase, endKm: odoBase + 520 }],
-        places: [
-          { type: 'ENTRY' as const, country: 'CZ', timestamp: `${dateStr}T06:00:00Z`, odometer: odoBase }
-        ]
-      });
+        rawDays.push({
+          dateStr,
+          activities: acts,
+          vehicles: [{ registration: vrn, startKm: odoBase, endKm: odoBase + km }],
+          places: [
+            { type: 'ENTRY' as const, country: 'CZ', timestamp: `${dateStr}T06:00:00Z`, odometer: odoBase }
+          ]
+        });
+      }
     }
   }
 

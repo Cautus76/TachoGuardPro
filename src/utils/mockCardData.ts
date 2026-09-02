@@ -1,22 +1,56 @@
 import { DriverCardInfo, DaySummary, ActivitySegment, FullTachographData } from '../types/tachograph';
 import { processRawDays, buildFullTachographData } from './legislationEngine';
 
-// Helper to generate a sequence of activities for a day
-function generateDayActivities(
+// Helper to build sequential timeline activities without overlapping timestamps or fixed repetitive templates
+function buildDayFromBlocks(
   dateStr: string,
-  schedule: { time: string; duration: number; type: 'REST' | 'WORK' | 'DRIVING' | 'AVAILABILITY'; vrn?: string }[]
+  blocks: { duration: number; type: 'REST' | 'WORK' | 'DRIVING' | 'AVAILABILITY'; cardStatus?: 'INSERTED' | 'NOT_INSERTED' }[],
+  vrn: string = '1AB 8492'
 ): ActivitySegment[] {
-  return schedule.map((item, idx) => ({
-    id: `act_${dateStr}_${idx}`,
-    timestamp: `${dateStr}T${item.time}:00Z`,
-    dateStr,
-    timeStr: item.time,
-    durationMinutes: item.duration,
-    activity: item.type,
-    slot: 'DRIVER_1',
-    cardStatus: 'INSERTED',
-    vehicleRegistration: item.vrn || '1AB 8492'
-  }));
+  let currentMinute = 0;
+  const segments: ActivitySegment[] = [];
+
+  for (let i = 0; i < blocks.length; i++) {
+    const b = blocks[i];
+    const h = Math.floor(currentMinute / 60);
+    const m = currentMinute % 60;
+    const timeStr = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+    
+    segments.push({
+      id: `act_${dateStr}_${i}`,
+      timestamp: `${dateStr}T${timeStr}:00Z`,
+      dateStr,
+      timeStr,
+      durationMinutes: b.duration,
+      activity: b.type,
+      slot: 'DRIVER_1',
+      cardStatus: b.cardStatus || (b.type === 'REST' && currentMinute === 0 && b.duration >= 300 ? 'NOT_INSERTED' : 'INSERTED'),
+      vehicleRegistration: vrn
+    });
+
+    currentMinute += b.duration;
+  }
+
+  // If blocks don't sum up to 1440 minutes, fill remainder with REST
+  if (currentMinute < 1440) {
+    const dur = 1440 - currentMinute;
+    const h = Math.floor(currentMinute / 60);
+    const m = currentMinute % 60;
+    const timeStr = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+    segments.push({
+      id: `act_${dateStr}_rest_end`,
+      timestamp: `${dateStr}T${timeStr}:00Z`,
+      dateStr,
+      timeStr,
+      durationMinutes: dur,
+      activity: 'REST',
+      slot: 'DRIVER_1',
+      cardStatus: 'INSERTED',
+      vehicleRegistration: vrn
+    });
+  }
+
+  return segments;
 }
 
 // Generate 28-day dataset for Jan Novák
@@ -34,8 +68,9 @@ function generateJanNovakDays(): DaySummary[] {
     const vrn = d % 14 > 7 ? '7AM 3301' : '1AB 8492';
     const odoBase = 450000 + d * 620;
 
-    if (dayOfWeek === 0 || dayOfWeek === 6) {
-      // Weekend / Weekly rest
+    // Days 25, 26, 27 are recent non-driving rest days (31.8., 1.9., 2.9.) or weekend
+    if (dayOfWeek === 0 || dayOfWeek === 6 || d >= 25) {
+      // Weekend / Rest / Off-duty day - 100% clean, 0 driving, 0 infractions
       const activities: ActivitySegment[] = [
         {
           id: `act_${dateStr}_0`,
@@ -46,7 +81,7 @@ function generateJanNovakDays(): DaySummary[] {
           activity: 'REST',
           slot: 'DRIVER_1',
           cardStatus: 'NOT_INSERTED',
-          vehicleRegistration: vrn
+          vehicleRegistration: ''
         }
       ];
 
@@ -54,21 +89,19 @@ function generateJanNovakDays(): DaySummary[] {
         dateStr,
         activities,
         vehicles: [],
-        places: [
-          { type: 'ENTRY' as const, country: 'CZ', timestamp: `${dateStr}T00:00:00Z`, odometer: odoBase }
-        ]
+        places: []
       });
     } else if (d === 11) {
       // INFRACTION DAY 1: Continuous drive exceeded (4h 44m continuous driving before parking)
-      const acts = generateDayActivities(dateStr, [
-        { time: '00:00', duration: 360, type: 'REST', vrn }, // 6h rest till 06:00
-        { time: '06:00', duration: 25, type: 'WORK', vrn }, // Pre-trip check
-        { time: '06:25', duration: 284, type: 'DRIVING', vrn }, // 4h 44m CONTINUOUS DRIVE! (Exceeds 4h30m by 14 min)
-        { time: '11:09', duration: 55, type: 'REST', vrn }, // 55m break
-        { time: '12:04', duration: 220, type: 'DRIVING', vrn }, // 3h 40m drive
-        { time: '15:44', duration: 30, type: 'WORK', vrn }, // Unloading
-        { time: '16:14', duration: 466, type: 'REST', vrn } // Daily rest
-      ]);
+      const acts = buildDayFromBlocks(dateStr, [
+        { duration: 360, type: 'REST' }, // 6h rest till 06:00
+        { duration: 25, type: 'WORK' }, // Pre-trip check 06:00-06:25
+        { duration: 284, type: 'DRIVING' }, // 4h 44m CONTINUOUS DRIVE! (Exceeds 4h30m by 14 min) 06:25-11:09
+        { duration: 55, type: 'REST' }, // 55m break 11:09-12:04
+        { duration: 220, type: 'DRIVING' }, // 3h 40m drive 12:04-15:44
+        { duration: 30, type: 'WORK' }, // Unloading 15:44-16:14
+        { duration: 466, type: 'REST' } // Daily rest 16:14-24:00
+      ], vrn);
 
       rawDays.push({
         dateStr,
@@ -81,16 +114,16 @@ function generateJanNovakDays(): DaySummary[] {
       });
     } else if (d === 18) {
       // INFRACTION DAY 2: Insufficient daily rest (8h 46m instead of min 9h)
-      const acts = generateDayActivities(dateStr, [
-        { time: '00:00', duration: 420, type: 'REST', vrn }, // Rest till 07:00
-        { time: '07:00', duration: 20, type: 'WORK', vrn },
-        { time: '07:20', duration: 240, type: 'DRIVING', vrn }, // 4h drive
-        { time: '11:20', duration: 50, type: 'REST', vrn }, // 50m break
-        { time: '12:10', duration: 260, type: 'DRIVING', vrn }, // 4h 20m drive (total 8h 20m)
-        { time: '16:30', duration: 45, type: 'WORK', vrn },
-        { time: '17:15', duration: 15, type: 'AVAILABILITY', vrn },
-        { time: '17:30', duration: 390, type: 'REST', vrn } // Rest started at 17:30
-      ]);
+      const acts = buildDayFromBlocks(dateStr, [
+        { duration: 420, type: 'REST' }, // Rest till 07:00
+        { duration: 20, type: 'WORK' }, // 07:00-07:20
+        { duration: 240, type: 'DRIVING' }, // 4h drive 07:20-11:20
+        { duration: 50, type: 'REST' }, // 50m break 11:20-12:10
+        { duration: 260, type: 'DRIVING' }, // 4h 20m drive (total 8h 20m) 12:10-16:30
+        { duration: 45, type: 'WORK' }, // 16:30-17:15
+        { duration: 15, type: 'AVAILABILITY' }, // 17:15-17:30
+        { duration: 390, type: 'REST' } // Rest started at 17:30 (8h 46m within 24h cycle)
+      ], vrn);
 
       rawDays.push({
         dateStr,
@@ -102,26 +135,87 @@ function generateJanNovakDays(): DaySummary[] {
         ]
       });
     } else {
-      // Normal compliant day (e.g. 8h 15m driving, 45m break, 11h rest)
-      const drivePart1 = 210 + (d % 3) * 15; // 3h 30m - 4h
-      const drivePart2 = 200 + (d % 4) * 10; // 3h 20m - 3h 50m
+      // Unique and varied daily profiles for each day of the week
+      let acts: ActivitySegment[] = [];
+      let kmDriven = 520;
 
-      const acts = generateDayActivities(dateStr, [
-        { time: '00:00', duration: 390, type: 'REST', vrn }, // rest till 06:30
-        { time: '06:30', duration: 20, type: 'WORK', vrn }, // inspection
-        { time: '06:50', duration: drivePart1, type: 'DRIVING', vrn }, // ~3.5h drive
-        { time: '10:30', duration: 48, type: 'REST', vrn }, // 48m break
-        { time: '11:18', duration: drivePart2, type: 'DRIVING', vrn }, // ~3.5h drive
-        { time: '15:00', duration: 35, type: 'WORK', vrn }, // unload
-        { time: '15:35', duration: 505, type: 'REST', vrn } // overnight rest
-      ]);
+      if (dayOfWeek === 1) {
+        // Monday: Early departure & route start
+        acts = buildDayFromBlocks(dateStr, [
+          { duration: 330, type: 'REST' }, // rest till 05:30
+          { duration: 20, type: 'WORK' }, // 05:30-05:50 vehicle prep
+          { duration: 225, type: 'DRIVING' }, // 3h 45m drive (05:50-09:35)
+          { duration: 45, type: 'REST' }, // 45m break (09:35-10:20)
+          { duration: 190, type: 'DRIVING' }, // 3h 10m drive (10:20-13:30)
+          { duration: 40, type: 'WORK' }, // 40m client unloading (13:30-14:10)
+          { duration: 55, type: 'DRIVING' }, // 55m relocation (14:10-15:05)
+          { duration: 15, type: 'WORK' }, // 15m parking & lock (15:05-15:20)
+          { duration: 520, type: 'REST' } // overnight rest (15:20-24:00)
+        ], vrn);
+        kmDriven = 580;
+      } else if (dayOfWeek === 2) {
+        // Tuesday: 3 driving blocks (3h 30m, 1h 15m, 3h 35m) with compliant 45m breaks (Total 8h 20m drive)
+        acts = buildDayFromBlocks(dateStr, [
+          { duration: 400, type: 'REST' }, // rest till 06:40
+          { duration: 25, type: 'WORK' }, // 06:40-07:05 vehicle prep
+          { duration: 210, type: 'DRIVING' }, // 3h 30m drive (07:05-10:35)
+          { duration: 45, type: 'REST' }, // 45m mandatory break (10:35-11:20) -> full reset
+          { duration: 75, type: 'DRIVING' }, // 1h 15m drive (11:20-12:35)
+          { duration: 45, type: 'REST' }, // 45m break (12:35-13:20) -> full reset
+          { duration: 215, type: 'DRIVING' }, // 3h 35m drive (13:20-16:55)
+          { duration: 25, type: 'WORK' }, // 25m unload (16:55-17:20)
+          { duration: 400, type: 'REST' } // rest (17:20-24:00)
+        ], vrn);
+        kmDriven = 610;
+      } else if (dayOfWeek === 3) {
+        // Wednesday: Distribution & logistics with availability periods
+        acts = buildDayFromBlocks(dateStr, [
+          { duration: 435, type: 'REST' }, // rest till 07:15
+          { duration: 15, type: 'WORK' }, // 07:15-07:30
+          { duration: 180, type: 'DRIVING' }, // 3h 00m drive (07:30-10:30)
+          { duration: 50, type: 'WORK' }, // 50m complex loading (10:30-11:20)
+          { duration: 45, type: 'REST' }, // 45m full break (11:20-12:05)
+          { duration: 195, type: 'DRIVING' }, // 3h 15m drive (12:05-15:20)
+          { duration: 25, type: 'AVAILABILITY' }, // 25m customs/gate wait (15:20-15:45)
+          { duration: 45, type: 'DRIVING' }, // 45m drive to parking (15:45-16:30)
+          { duration: 450, type: 'REST' } // rest (16:30-24:00)
+        ], vrn);
+        kmDriven = 490;
+      } else if (dayOfWeek === 4) {
+        // Thursday: Long haul highway run (fully compliant with 2x 45m breaks)
+        acts = buildDayFromBlocks(dateStr, [
+          { duration: 310, type: 'REST' }, // rest till 05:10
+          { duration: 20, type: 'WORK' }, // 05:10-05:30 vehicle check
+          { duration: 235, type: 'DRIVING' }, // 3h 55m drive (05:30-09:25)
+          { duration: 50, type: 'REST' }, // 50m break (09:25-10:15)
+          { duration: 205, type: 'DRIVING' }, // 3h 25m drive (10:15-13:40)
+          { duration: 35, type: 'WORK' }, // 35m client stop (13:40-14:15)
+          { duration: 45, type: 'REST' }, // 45m mandatory break (14:15-15:00)
+          { duration: 110, type: 'DRIVING' }, // 1h 50m return drive (15:00-16:50)
+          { duration: 20, type: 'WORK' }, // 20m fueling (16:50-17:10)
+          { duration: 410, type: 'REST' } // rest (17:10-24:00)
+        ], vrn);
+        kmDriven = 640;
+      } else {
+        // Friday: Return to base & pre-weekend rest
+        acts = buildDayFromBlocks(dateStr, [
+          { duration: 375, type: 'REST' }, // rest till 06:15
+          { duration: 25, type: 'WORK' }, // 06:15-06:40
+          { duration: 195, type: 'DRIVING' }, // 3h 15m drive (06:40-09:55)
+          { duration: 45, type: 'REST' }, // 45m break (09:55-10:40)
+          { duration: 160, type: 'DRIVING' }, // 2h 40m return (10:40-13:20)
+          { duration: 40, type: 'WORK' }, // 40m base handover & wash (13:20-14:00)
+          { duration: 600, type: 'REST' } // Weekly rest starts 14:00 (14:00-24:00)
+        ], vrn);
+        kmDriven = 420;
+      }
 
       rawDays.push({
         dateStr,
         activities: acts,
-        vehicles: [{ registration: vrn, startKm: odoBase, endKm: odoBase + 580 }],
+        vehicles: [{ registration: vrn, startKm: odoBase, endKm: odoBase + kmDriven }],
         places: [
-          { type: 'ENTRY' as const, country: 'CZ', timestamp: `${dateStr}T06:30:00Z`, odometer: odoBase }
+          { type: 'ENTRY' as const, country: 'CZ', timestamp: `${dateStr}T06:00:00Z`, odometer: odoBase }
         ]
       });
     }
@@ -144,8 +238,8 @@ function generatePetrSvobodaDays(): DaySummary[] {
     const vrn = '2SN 4819';
     const odoBase = 185000 + d * 340;
 
-    if (dayOfWeek === 0 || dayOfWeek === 6) {
-      // Weekend rest
+    if (dayOfWeek === 0 || dayOfWeek === 6 || d >= 25) {
+      // Weekend / Rest day (including recent days 31.8., 1.9., 2.9.)
       rawDays.push({
         dateStr,
         activities: [
@@ -158,7 +252,7 @@ function generatePetrSvobodaDays(): DaySummary[] {
             activity: 'REST' as const,
             slot: 'DRIVER_1' as const,
             cardStatus: 'NOT_INSERTED' as const,
-            vehicleRegistration: vrn
+            vehicleRegistration: ''
           }
         ],
         vehicles: []
@@ -166,18 +260,18 @@ function generatePetrSvobodaDays(): DaySummary[] {
     } else {
       // Urban split breaks: 15 min break early + 30 min break later
       const is10hDay = (dayOfWeek === 2 || dayOfWeek === 4); // Tuesday & Thursday 10h drive (allowed max 2x)
-      const acts = generateDayActivities(dateStr, [
-        { time: '00:00', duration: 360, type: 'REST', vrn }, // rest till 06:00
-        { time: '06:00', duration: 30, type: 'WORK', vrn }, // load
-        { time: '06:30', duration: 110, type: 'DRIVING', vrn }, // 1h 50m
-        { time: '08:20', duration: 18, type: 'REST', vrn }, // 18m SPLIT PART 1 (>= 15m)
-        { time: '08:38', duration: 130, type: 'DRIVING', vrn }, // 2h 10m
-        { time: '10:48', duration: 35, type: 'REST', vrn }, // 35m SPLIT PART 2 (>= 30m) -> RESET!
-        { time: '11:23', duration: 120, type: 'DRIVING', vrn }, // 2h
-        { time: '13:23', duration: 40, type: 'WORK', vrn },
-        { time: '14:03', duration: is10hDay ? 220 : 140, type: 'DRIVING', vrn }, // extra drive on allowed days
-        { time: '17:43', duration: 377, type: 'REST', vrn }
-      ]);
+      const acts = buildDayFromBlocks(dateStr, [
+        { duration: 360, type: 'REST' }, // rest till 06:00
+        { duration: 30, type: 'WORK' }, // 06:00-06:30 load
+        { duration: 110, type: 'DRIVING' }, // 1h 50m (06:30-08:20)
+        { duration: 18, type: 'REST' }, // 18m SPLIT PART 1 (08:20-08:38, >= 15m)
+        { duration: 130, type: 'DRIVING' }, // 2h 10m (08:38-10:48)
+        { duration: 35, type: 'REST' }, // 35m SPLIT PART 2 (10:48-11:23, >= 30m) -> RESET!
+        { duration: 120, type: 'DRIVING' }, // 2h 00m (11:23-13:23)
+        { duration: 40, type: 'WORK' }, // 13:23-14:03
+        { duration: is10hDay ? 220 : 140, type: 'DRIVING' }, // extra drive on allowed days (14:03-17:43)
+        { duration: 377, type: 'REST' }
+      ], vrn);
 
       rawDays.push({
         dateStr,
@@ -230,15 +324,15 @@ function generateMartinKovarDays(): DaySummary[] {
       const driveMin1 = d === 15 ? 315 : 260; // 5h 15m continuous drive on day 15!
       const driveMin2 = 320; // 5h 20m drive (Total 9h 40m - 10h 35m)
 
-      const acts = generateDayActivities(dateStr, [
-        { time: '00:00', duration: 330, type: 'REST', vrn }, // 5.5h rest (insufficient!)
-        { time: '05:30', duration: 25, type: 'WORK', vrn },
-        { time: '05:55', duration: driveMin1, type: 'DRIVING', vrn },
-        { time: '11:10', duration: 30, type: 'REST', vrn }, // 30m break (insufficient for full reset)
-        { time: '11:40', duration: driveMin2, type: 'DRIVING', vrn },
-        { time: '17:00', duration: 35, type: 'WORK', vrn },
-        { time: '17:35', duration: 385, type: 'REST', vrn }
-      ]);
+      const acts = buildDayFromBlocks(dateStr, [
+        { duration: 330, type: 'REST' }, // 5.5h rest (insufficient!) 00:00-05:30
+        { duration: 25, type: 'WORK' }, // 05:30-05:55
+        { duration: driveMin1, type: 'DRIVING' }, // 05:55-...
+        { duration: 30, type: 'REST' }, // 30m break (insufficient for full reset)
+        { duration: driveMin2, type: 'DRIVING' },
+        { duration: 35, type: 'WORK' },
+        { duration: 385, type: 'REST' }
+      ], vrn);
 
       rawDays.push({
         dateStr,

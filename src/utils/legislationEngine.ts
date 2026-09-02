@@ -188,7 +188,7 @@ export function processRawDays(
     places?: { type: 'ENTRY' | 'EXIT'; country: string; timestamp: string; odometer: number }[];
   }[]
 ): DaySummary[] {
-  return rawDays.map(rawDay => {
+  return rawDays.map((rawDay, dayIndex, allRawDays) => {
     const dateObj = new Date(rawDay.dateStr + 'T12:00:00Z');
     const dayOfWeek = dateObj.getUTCDay();
     const dayNameCz = DAY_NAMES_CZ[dayOfWeek];
@@ -231,11 +231,21 @@ export function processRawDays(
       distanceKm: Math.max(0, v.endKm - v.startKm)
     }));
 
-    // Identify end-of-day or longest daily rest
-    // A daily rest must be analyzed within 24h cycle
+    // Daily rest evaluation (including cross-day rest into next day and within 24h shift cycle):
     let maxConsecutiveRestMinutes = 0;
     let currentRestStreak = 0;
+    let shiftStartMinuteOfDay = -1;
+    let shiftEndMinuteOfDay = -1;
+    let currentMinTracker = 0;
+
     for (const act of activities) {
+      if (act.activity !== 'REST' && shiftStartMinuteOfDay === -1) {
+        shiftStartMinuteOfDay = currentMinTracker;
+      }
+      if (act.activity !== 'REST') {
+        shiftEndMinuteOfDay = currentMinTracker + act.durationMinutes;
+      }
+
       if (act.activity === 'REST') {
         currentRestStreak += act.durationMinutes;
         if (currentRestStreak > maxConsecutiveRestMinutes) {
@@ -244,19 +254,158 @@ export function processRawDays(
       } else {
         currentRestStreak = 0;
       }
+      currentMinTracker += act.durationMinutes;
+    }
+
+    // Check rest extending into next day (Inter-day rest across midnight)
+    let restExtendingIntoNextDay = 0;
+    let restIn24hWindow = 0;
+    
+    if (shiftEndMinuteOfDay >= 0) {
+      const restTillMidnight = Math.max(0, 1440 - shiftEndMinuteOfDay);
+      let nextDayRestStart = 0;
+      let nextDayFirstWorkMin = 1440;
+
+      if (dayIndex + 1 < allRawDays.length) {
+        const nextDayActs = allRawDays[dayIndex + 1].activities;
+        let nextMin = 0;
+        for (const na of nextDayActs) {
+          if (na.activity === 'REST') {
+            nextDayRestStart += na.durationMinutes;
+          } else {
+            nextDayFirstWorkMin = nextMin;
+            break;
+          }
+          nextMin += na.durationMinutes;
+        }
+      } else {
+        // If it's the last day in record, assume regular rest continues
+        nextDayRestStart = 660;
+        nextDayFirstWorkMin = 660;
+      }
+
+      restExtendingIntoNextDay = restTillMidnight + nextDayRestStart;
+      // Within the 24h window from shift start (e.g. 05:10 on Day 1 to 05:10 on Day 2)
+      const allowedNextDayMinutes = shiftStartMinuteOfDay >= 0 ? shiftStartMinuteOfDay : 360;
+      restIn24hWindow = restTillMidnight + Math.min(nextDayFirstWorkMin, allowedNextDayMinutes);
+      
+      maxConsecutiveRestMinutes = Math.max(maxConsecutiveRestMinutes, restExtendingIntoNextDay, restIn24hWindow);
     }
 
     // Determine rest type for day
     let dailyRestType: DaySummary['dailyRestType'] = 'NONE';
-    if (maxConsecutiveRestMinutes >= 45 * 60) {
+    const isPureRestDay = totalDrivingMinutes === 0 && totalWorkMinutes === 0;
+
+    if (isPureRestDay) {
+      // Clean non-driving / rest day
+      dailyRestType = maxConsecutiveRestMinutes >= 45 * 60 ? 'WEEKLY_REST' : 'REGULAR_11H';
+      maxConsecutiveRestMinutes = Math.max(maxConsecutiveRestMinutes, 1440);
+    } else if (maxConsecutiveRestMinutes >= 45 * 60) {
       dailyRestType = 'WEEKLY_REST';
-    } else if (maxConsecutiveRestMinutes >= 11 * 60) {
+    } else if (maxConsecutiveRestMinutes >= 11 * 60 || restIn24hWindow >= 11 * 60) {
       dailyRestType = 'REGULAR_11H';
-    } else if (maxConsecutiveRestMinutes >= 9 * 60) {
+    } else if (maxConsecutiveRestMinutes >= 9 * 60 || restIn24hWindow >= 9 * 60) {
       dailyRestType = 'REDUCED_9H';
-    } else if (totalDrivingMinutes > 0 && maxConsecutiveRestMinutes < 9 * 60) {
+    } else {
       dailyRestType = 'INSUFFICIENT';
     }
+
+    // Country Continuity and Place Entry/Exit Validation (Article 34 (6) & (7) of Regulation (EU) 165/2014 & Mobility Package I)
+    const dayPlaces = rawDay.places || [];
+    const placeInfractions: Infraction[] = [];
+
+    if (!isPureRestDay) {
+      // 1. Identify start place (ENTRY) and end place (EXIT) for this active shift
+      const startPlace = dayPlaces.find(p => p.type === 'ENTRY') || dayPlaces[0];
+      const endPlace = [...dayPlaces].reverse().find(p => p.type === 'EXIT');
+
+      // Find previous active day with places
+      let prevActiveDay: (typeof allRawDays)[number] | null = null;
+      for (let pi = dayIndex - 1; pi >= 0; pi--) {
+        const candidate = allRawDays[pi];
+        const hadDriveOrWork = candidate.activities.some(a => a.activity === 'DRIVING' || a.activity === 'WORK');
+        if (hadDriveOrWork || (candidate.places && candidate.places.length > 0)) {
+          prevActiveDay = candidate;
+          break;
+        }
+      }
+
+      let prevEndCountry: string | null = null;
+      if (prevActiveDay && prevActiveDay.places && prevActiveDay.places.length > 0) {
+        const prevPlaces = prevActiveDay.places;
+        const prevExit = [...prevPlaces].reverse().find(p => p.type === 'EXIT');
+        prevEndCountry = prevExit ? prevExit.country : prevPlaces[prevPlaces.length - 1].country;
+      }
+
+      // Check A: Missing Start Country (Chybějící symbol výchozí země na začátku směny)
+      if (!startPlace) {
+        placeInfractions.push({
+          id: `inf_startcountry_${rawDay.dateStr}`,
+          dateStr: rawDay.dateStr,
+          timeStr: shiftStart ? shiftStart.split('T')[1]?.slice(0, 5) || '06:00' : '06:00',
+          timestamp: shiftStart || `${rawDay.dateStr}T06:00:00Z`,
+          type: 'MISSING_START_COUNTRY',
+          severity: 'SERIOUS',
+          severityLabelCz: 'Závažný (SI)',
+          articleRef: 'Čl. 34 odst. 7 Nařízení (EU) 165/2014',
+          title: 'Chybějící symbol výchozí země na začátku směny',
+          description: prevEndCountry 
+            ? `Při zahájení směny nebyl do tachografu zadán symbol výchozí země (ENTRY). Vzhledem k předchozímu ukončení směny v zemi [${prevEndCountry}] měla být zadána výchozí země [${prevEndCountry}].`
+            : 'Při zahájení denní pracovní doby nebyl do tachografu zadán symbol výchozí země (ENTRY).',
+          measuredValueStr: 'Chybí symbol výchozí země',
+          legalLimitStr: 'Povinné zadání symbolu státu na začátku pracovní doby',
+          excessStr: 'Záznam chybí',
+          fineEstimateCZK: '2 000 – 5 000 Kč',
+          fineEstimateEUR: '100 – 250 €',
+          pointsCZ: 0,
+          recommendation: 'Při zahájení každé denní pracovní doby (vložení karty nebo ukončení odpočinku) je řidič povinen v tachografu potvrdit nebo zadat symbol výchozího státu.',
+          legalArticleNote: 'Řidič zadá do digitálního tachografu symboly zemí, ve kterých zahajuje a ukončuje svou denní pracovní dobu.'
+        });
+      } else if (prevEndCountry && startPlace.country !== prevEndCountry) {
+        // Normalize country codes (e.g., 'DE' vs 'D')
+        const normCurrent = startPlace.country.trim().toUpperCase();
+        const normPrev = prevEndCountry.trim().toUpperCase();
+        const isMatch = normCurrent === normPrev || 
+          (normCurrent === 'DE' && normPrev === 'D') || 
+          (normCurrent === 'D' && normPrev === 'DE');
+
+        if (!isMatch) {
+          const hasFerryOrSpecial = activities.some(a => a.specificCondition === 'FERRY_TRAIN' || a.specificCondition === 'OUT_OF_SCOPE') ||
+            (prevActiveDay?.activities || []).some(a => a.specificCondition === 'FERRY_TRAIN' || a.specificCondition === 'OUT_OF_SCOPE');
+
+          if (!hasFerryOrSpecial) {
+            placeInfractions.push({
+              id: `inf_country_mismatch_${rawDay.dateStr}`,
+              dateStr: rawDay.dateStr,
+              timeStr: startPlace.timestamp ? startPlace.timestamp.split('T')[1]?.slice(0, 5) || '06:00' : '06:00',
+              timestamp: startPlace.timestamp || `${rawDay.dateStr}T06:00:00Z`,
+              type: 'COUNTRY_CONTINUITY_ERROR',
+              severity: 'SERIOUS',
+              severityLabelCz: 'Závažný (SI)',
+              articleRef: 'Čl. 34 odst. 6 a 7 Nařízení (EU) 165/2014',
+              title: 'Neshoda výchozí země s místem ukončení předchozí směny',
+              description: `Předchozí směna (${prevActiveDay?.dateStr}) skončila v zemi [${prevEndCountry}], avšak nová směna byla zahájena se symbolem [${startPlace.country}] bez zaznamenané přepravy. Chybí výchozí země [${prevEndCountry}].`,
+              measuredValueStr: `Zadáno: ${startPlace.country} (ukončeno v: ${prevEndCountry})`,
+              legalLimitStr: `Výchozí země musí navazovat na zemi ukončení (${prevEndCountry})`,
+              excessStr: 'Neshoda návaznosti státu',
+              fineEstimateCZK: '3 000 – 5 000 Kč',
+              fineEstimateEUR: '150 – 250 €',
+              pointsCZ: 0,
+              recommendation: `Při zahájení směny po odpočinku v zahraničí (zde [${prevEndCountry}]) musíte jako výchozí zemi zadat [${prevEndCountry}]. Symbol ${startPlace.country} lze zadat až po návratu nebo překročení státních hranic.`,
+              legalArticleNote: 'Symboly zemí zadávané do tachografu musí odpovídat skutečnému geografickému místu zahájení a ukončení pracovní doby.'
+            });
+          }
+        }
+      }
+
+      // Check C: If vehicle traveled across borders (e.g. from CZ into foreign country) but end country was not entered
+      if (startPlace && !endPlace && dayPlaces.length === 1 && totalDrivingMinutes > 120) {
+        // Only if multiple vehicle journeys or if border crossing detected
+      }
+    }
+
+    // Safety guarantee: If no driving or work occurred on this day, there can NEVER be any infractions
+    const finalInfractions = isPureRestDay ? [] : [...contInfractions, ...placeInfractions];
 
     const daySummary: DaySummary = {
       dateStr: rawDay.dateStr,
@@ -276,8 +425,8 @@ export function processRawDays(
       isExtendedDrivingDay: totalDrivingMinutes > 9 * 60,
       dailyRestMinutes: maxConsecutiveRestMinutes,
       dailyRestType,
-      infractions: [...contInfractions],
-      isComplianceClean: contInfractions.length === 0
+      infractions: finalInfractions,
+      isComplianceClean: finalInfractions.length === 0
     };
 
     return daySummary;

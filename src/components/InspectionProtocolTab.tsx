@@ -211,6 +211,20 @@ export const InspectionProtocolTab: React.FC<InspectionProtocolTabProps> = ({ da
                   {allInfractions.find(i => i.type === 'BIWEEKLY_DRIVE_EXCEEDED')?.excessStr || 'V normě'}
                 </td>
               </tr>
+              <tr>
+                <td className="py-2 px-3 border-r border-slate-300 font-semibold">Čl. 34 odst. 6 a 7 (EU 165/2014) – Symboly zemí a hranice</td>
+                <td className="py-2 px-3 border-r border-slate-300">Povinné zadání výchozí/cílové země a návaznost států</td>
+                <td className="py-2 px-3 border-r border-slate-300">
+                  {allInfractions.some(i => i.type === 'MISSING_START_COUNTRY' || i.type === 'MISSING_END_COUNTRY' || i.type === 'COUNTRY_CONTINUITY_ERROR' || i.type === 'MISSING_BORDER_CROSSING_ENTRY') ? (
+                    <span className="font-bold text-rose-600">PŘESTUPEK</span>
+                  ) : (
+                    <span className="font-bold text-emerald-600">VYHOVUJE</span>
+                  )}
+                </td>
+                <td className="py-2 px-3 text-slate-700">
+                  {allInfractions.find(i => i.type === 'MISSING_START_COUNTRY' || i.type === 'MISSING_END_COUNTRY' || i.type === 'COUNTRY_CONTINUITY_ERROR' || i.type === 'MISSING_BORDER_CROSSING_ENTRY')?.excessStr || 'V normě'}
+                </td>
+              </tr>
             </tbody>
           </table>
         </div>
